@@ -23,14 +23,12 @@ def qft_transpilation(num_q: int, gate_sets_list: list):
     qft_circuit = qiskit_to_bqskit(qft_circuit)
     fc.save_circuit_to_qasm(qft_circuit, f"qft_{num_q}_qubits_original")
 
-
 def build_circuit(name: str, n_qubits: int):
     if name == "google":
         qft_circuit = fc.get_qft_circuit(n_qubits=n_qubits)
         gate_set = fc.get_gate_set(name)
         return fc.transpile_circuit_bqskit(qft_circuit, gate_set, optimization_level=2)
     return fc.load_circuit_from_qasm(f"qft_{n_qubits}_qubits_{name}")
-
     
 def get_original_unitary(n_qubits: int):
 
@@ -38,25 +36,11 @@ def get_original_unitary(n_qubits: int):
     return fc.get_circuit_unitary(circ)
 
 
-def compute_error_b_array(error_type: str, circuit, layer_unitaries_list, l):
-
-    if error_type in ("x", "y", "z"):
-        b_array = fc.compute_B_array(layer_unitaries_list, l, noise_generator=error_type)
-    elif error_type == "coherent_control":
-        b_array = fc.compute_B_array_coherent_controll(circuit)
-    else:
-        raise ValueError(f"Unknown error type: {error_type}")
-
-
-    return b_array
-
-
-
 if __name__ == "__main__":
 
     n_qubits = [3]
     dev_names = ["rigetti", "ibm", "google", "quantinuum"]
-    deltas = list(np.logspace(-5, -1, num=17))
+    deltas = list(np.logspace(-5, -1, num=17)) 
     error_list = ["x", "y", "z", "coherent_control"]
 
     # Transpile the QFT circuit into the gate sets
@@ -67,7 +51,7 @@ if __name__ == "__main__":
     for name in gate_sets_plot:
         fc.plot_circuit_diagrams(name=name, n_qubits=n_qubits[0])
 
-    b2_iterations = 1000
+    b2_iterations = 100
 
     all_results = {}
     total_iterations = len(n_qubits) * len(dev_names) * len(deltas) * len(error_list)
@@ -76,22 +60,29 @@ if __name__ == "__main__":
     for n_q in n_qubits:
         for dev_name in dev_names:
             circuit = build_circuit(name=dev_name, n_qubits=n_q)
+            print("Circuit built.", flush=True)
             unitary_circuit = fc.get_circuit_unitary(circuit=circuit)
-            circuit_original = get_original_unitary(n_qubits=n_q)
-            unitary_original = fc.get_circuit_unitary(circuit=circuit_original)
+            unitary_original = get_original_unitary(n_qubits=n_q)
             transpilation_fidelity = fc.fidelity(unitary1=unitary_original, unitary2=unitary_circuit)
-            layer_unitaries_list = fc.get_layer_unitaries_bqskit(circuit)
+            print(f"Transpilation fidelity for {dev_name} with {n_q} qubits: {transpilation_fidelity:.6f}", flush=True)
+            layer_unitaries_list = fc.get_layer_per_gate_unitaries_bqskit(circuit)
             N = len(layer_unitaries_list)
             num_gates = circuit.num_operations
             for error in error_list:
-                b_array = compute_error_b_array(error_type=error, circuit=circuit, layer_unitaries_list=layer_unitaries_list, l=n_q)
+                b_array, K = fc.compute_local_error_b_array(error_type=error, circuit=circuit, layer_unitaries_list=layer_unitaries_list)
                 v_list = fc.calculate_V(U_ideal_list=layer_unitaries_list)
                 m = fc.compute_M(V_list=v_list, B_array=b_array)
                 if error == "coherent_control":
                     gamma_b4 = fc.calculate_norm_based_gamma_bound(M=m, l=1, num_unitaries=N)
                 else:
-                    gamma_b4 = fc.calculate_norm_based_gamma_bound(M=m, l=n_q, num_unitaries=N)
+                    gamma_b4 = fc.calculate_norm_based_gamma_bound(M=m, l=1, num_unitaries=N)
+                print(f"Computed gamma_b4 for {dev_name} with {n_q} qubits and error {error}: {gamma_b4:.6f}", flush=True)
                 gamma_b2, mean_gamma_b2, std_gamma_b2 = fc.compute_gamma_optimization(v_list, b_array, iterations=b2_iterations)
+                gamma_b4 /= K
+                gamma_b2 /= K
+                mean_gamma_b2 /= K
+                std_gamma_b2 /= K
+                print(f"Computed gamma_b2 for {dev_name} with {n_q} qubits and error {error}: {gamma_b2:.6f}", flush=True)
                 noiseless_unitary = fc.get_circuit_unitary(circuit=circuit)
                 for delt in deltas:
                     print(f"Iteration {iteration+1}/{total_iterations}: n_q={n_q}, dev={dev_name}, delta={delt:.1e}, error={error}", flush=True)
@@ -105,7 +96,7 @@ if __name__ == "__main__":
                     fidelities = []
                     runs = 10000
                     for i in range(runs):
-                        noise_unitary_list = fc.get_noise_unitary_list_from_B_array(B_array=b_array, delta=delt, seed=i)
+                        noise_unitary_list = fc.get_noise_unitary_list_from_B_array(B_array=b_array, delta=delt, K=K, seed=i)
 
                         total_noisy_unitary = fc.get_total_circuit_unitary(noiseless_unitaries=layer_unitaries_list, noise_unitaries=noise_unitary_list)
                         fidelity = fc.fidelity(unitary1=noiseless_unitary, unitary2=total_noisy_unitary)
@@ -131,5 +122,5 @@ if __name__ == "__main__":
                     all_results[key] = results
 
     current_time = datetime.now().strftime("%m%d%H%M")
-    with open(f'./Results/QFT/results{current_time}.pkl', 'wb') as f:
+    with open(f'./QFT_and_adder/Results/QFT/results{current_time}.pkl', 'wb') as f:
         pickle.dump(all_results, f)

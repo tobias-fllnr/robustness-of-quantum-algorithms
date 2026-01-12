@@ -1,4 +1,5 @@
 import numpy as np
+import networkx as nx
 from qiskit.synthesis.qft import synth_qft_full
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Operator
@@ -30,7 +31,7 @@ def save_circuit_to_qasm(circuit: Circuit, filename: str):
         circuit (QuantumCircuit): The quantum circuit to save.
         filename (str): The name of the file to save the circuit to.
     """
-    circuit.save(f'./Circuits/{filename}.qasm')
+    circuit.save(f'./QFT_and_adder/Circuits/{filename}.qasm')
 
 def load_circuit_from_qasm(filename: str) -> Circuit:
     """
@@ -42,7 +43,7 @@ def load_circuit_from_qasm(filename: str) -> Circuit:
     Returns:
         QuantumCircuit: The loaded quantum circuit.
     """
-    return Circuit.from_file(f'./Circuits/{filename}.qasm')
+    return Circuit.from_file(f'./QFT_and_adder/Circuits/{filename}.qasm')
 
 def get_circuit_unitary(circuit: Circuit) -> np.ndarray:
     """
@@ -72,12 +73,13 @@ def get_total_circuit_unitary(noiseless_unitaries: list, noise_unitaries: list) 
         total_unitary =  U_n @ U_e @ total_unitary
     return total_unitary
 
-def get_noise_unitary_list_from_B_array(B_array: np.ndarray, delta: float, seed: int=None) -> list:
+def get_noise_unitary_list_from_B_array(B_array: np.ndarray, delta: float, K: float, seed: int=None) -> list:
     """
     Generate a list of noise unitary matrices from a B_array.
     Args:
         B_array (np.ndarray): A 4D array of shape (num_layers, l, dim, dim) representing the B_{j,i} matrices.
         delta (float): Maximum noise level.
+        K (float): Scaling factor for the noise Hamiltonian.
         seed (int, optional): Random seed for reproducibility.
     Returns:
         List[np.ndarray]: A list of noise unitary matrices, one for each layer.
@@ -92,48 +94,11 @@ def get_noise_unitary_list_from_B_array(B_array: np.ndarray, delta: float, seed:
         H_e = np.zeros((dim, dim), dtype=complex)
         for j in range(l):
             H_e += theta[j] * B_array[i, j]
+        H_e /= K  # Scale by K
         # Turn H_e into a unitary
         noise_unitary = expm(-1j * H_e)
         noise_unitaries.append(noise_unitary)
     return noise_unitaries
-
-def get_layer_unitaries_bqskit(circuit: Circuit) -> list:
-    """
-    Return list of unitary matrices for each parallel layer in the circuit.
-    Args:
-        circuit (Circuit): Input quantum circuit.
-    Returns:
-        List[np.ndarray]: List of unitary matrices, one per layer.
-    """
-    num_qudits = circuit.num_qudits
-    unitary_list = []
-
-    current_layer = []
-    occupied_qudits = set()
-
-    def finalize_layer():
-        """Build subcircuit from current layer and get unitary."""
-        if not current_layer:
-            return
-        subcircuit = Circuit(num_qudits)
-        for op in current_layer:
-            subcircuit.append_gate(op.gate, op.location, op.params)
-        unitary = subcircuit.get_unitary()
-        unitary_list.append(unitary)
-        current_layer.clear()
-        occupied_qudits.clear()
-
-    for op in circuit:
-        # If current operation conflicts with current layer (qudit reuse), flush layer
-        if any(q in occupied_qudits for q in op.location):
-            finalize_layer()
-        current_layer.append(op)
-        occupied_qudits.update(op.location)
-
-    # Final flush
-    finalize_layer()
-
-    return unitary_list
 
 def get_gate_set(gate_set_name: str) -> set:
     """
@@ -210,82 +175,10 @@ def unitaries_to_generators(unitary_list: list) -> list:
         H = 1j * logm(U)  # Hermitian generator
         # Ensure Hermiticity numerically
         H = (H + H.conj().T) / 2
+        # Remove the trace (global phase component)
+        H -= np.trace(H) / H.shape[0] * np.eye(H.shape[0])
         generators.append(H)
     return generators
-
-def compute_B_array(U_list: list, l: int, noise_generator: str = "z") -> np.ndarray:
-    """
-    Computes the B_{j,i} matrices for a list of unitaries U_j.
-
-    Args:
-        U_list (list of np.ndarray): List of N unitaries U_j of shape (dim, dim).
-        l (int): Number of independent errors per layer
-        noise_operator (str): Type of noise operator ("rz" or "rx").
-    Returns:
-        np.ndarray: A 4D array B_{j,i} of shape (N, l, dim, dim) where N is the number of layers.
-    """
-    N = len(U_list)
-    dim = U_list[0].shape[0]
-    
-    # Initialize B_array with zeros
-    B_array = np.zeros((N, l, dim, dim), dtype=complex)
-
-    if noise_generator == "z":
-        noise_matrix = np.array([[1, 0], [0, -1]], dtype=complex)
-    elif noise_generator == "x":
-        noise_matrix = np.array([[0, 1], [1, 0]], dtype=complex)
-    elif noise_generator == "y":
-        noise_matrix = np.array([[0, -1j], [1j, 0]], dtype=complex)
-    else:
-        raise ValueError(f"Unsupported noise generator: {noise_generator}")
-    
-    for i in range(N):
-        for j in range(l):
-            # Create tensor product of noise matrix with identity on qubit j
-            noise_tensor = np.kron(np.eye(2**j, dtype=complex), np.kron(noise_matrix, np.eye(2**(l-j-1), dtype=complex)))
-            B_array[i, j] = noise_tensor
-    return B_array
-
-def compute_B_array_coherent_controll(circuit: Circuit):
-    """
-    Computes the B_{j,i} matrices for a BQSKit circuit, where each layer is treated as a subcircuit.
-    Args:
-        circuit (Circuit): Input quantum circuit.
-    Returns:
-        np.ndarray: A 4D array B_{j,i} of shape (num_layers, l, dim, dim) where num_layers is the depth of the circuit.
-    """
-    num_qudits = circuit.num_qudits
-    num_layers = circuit.depth
-    B_array = np.zeros((num_layers, 1, 2**num_qudits, 2**num_qudits), dtype=complex)
-    current_layer = []
-    occupied_qudits = set()
-    def finalize_layer(i):
-        if not current_layer:
-            return
-        subcircuit = Circuit(num_qudits)
-        for j, op in enumerate(current_layer):
-            subcircuit.append_gate(op.gate, op.location, op.params)
-        unitary = subcircuit.get_unitary()
-        H = 1j * logm(unitary)  # Hermitian generator
-        # ensure hermitianity numerically
-        H = (H + H.conj().T) / 2
-        B_array[i, 0] = H
-        i += 1
-        current_layer.clear()
-        occupied_qudits.clear()
-
-    i = 0
-    for op in circuit:
-        # If current operation conflicts with current layer (qudit reuse), flush layer
-        if any(q in occupied_qudits for q in op.location):
-            finalize_layer(i)
-            i = i + 1
-        current_layer.append(op)
-        occupied_qudits.update(op.location)
-
-    # Final flush
-    finalize_layer(i)
-    return B_array
 
 def compute_M(V_list: list[np.ndarray], B_array: np.ndarray) -> np.ndarray:
     """
@@ -472,8 +365,8 @@ def plot_circuit_diagrams(name: str, n_qubits: int):
         n_qubits (int): Number of qubits in the circuit.
     """
 
-    output_dir = f"./Plots/Circuits/circuit_diagram_qft_{n_qubits}_qubits_{name}.pdf"
-    qasm_file = f"./Circuits/qft_{n_qubits}_qubits_{name}.qasm"
+    output_dir = f"./QFT_and_adder/Plots/Circuits/circuit_diagram_qft_{n_qubits}_qubits_{name}.pdf"
+    qasm_file = f"./QFT_and_adder/Circuits/qft_{n_qubits}_qubits_{name}.qasm"
     if name in ["rigetti", "original"]:
         # Load the circuit from a .qasm file
         qc = QuantumCircuit.from_qasm_file(qasm_file)
@@ -593,3 +486,214 @@ def plot_circuit_diagrams(name: str, n_qubits: int):
 
         # Draw the circuit
         qc.draw(output="mpl", style="bw", fold=14, filename=output_dir)
+
+def get_layer_per_gate_unitaries_bqskit(circuit: Circuit) -> list:
+    """
+    Return list of unitary matrices for each gate in the circuit.
+    Args:
+        circuit (Circuit): Input quantum circuit.
+    Returns:
+        List[np.ndarray]: List of unitary matrices, one per gate.
+    """
+    num_qudits = circuit.num_qudits
+    unitary_list = []
+
+    for op in circuit:
+        subcircuit = Circuit(num_qudits)
+        subcircuit.append_gate(op.gate, op.location, op.params)
+        unitary = subcircuit.get_unitary()
+        unitary_list.append(unitary)
+
+    return unitary_list
+
+def compute_local_error_b_array(error_type: str, circuit: Circuit, layer_unitaries_list: list) -> np.ndarray:
+    """
+    Computes the B_{j,i} matrices for a given error type.
+    Args:
+        error_type (str): Type of error ("x", "y", "z", "coherent_control").
+        circuit (Circuit): Input quantum circuit.
+        layer_unitaries_list (list of np.ndarray): List of unitaries for each layer.
+        l (int): Number of independent errors per layer.
+    Returns:
+        np.ndarray: A 4D array B_{j,i} of shape (N, l, dim, dim) where N is the number of layers.
+    """
+    if error_type in ("x", "y", "z"):
+        b_array = compute_B_array_local_error(circuit, noise_generator=error_type)
+        K = 1.0  # For local errors, K is 1
+    elif error_type == "coherent_control":
+        b_array, K = compute_B_array_coherent_controll_local_error(layer_unitaries_list)
+    else:
+        raise ValueError(f"Unknown error type: {error_type}")
+    
+    return b_array, K
+    
+def compute_B_array_local_error(circuit: Circuit, noise_generator: str = "z") -> np.ndarray:
+    """
+    Computes the B_{j,i} matrices for a BQSKit circuit, where each gate is treated individually
+    Args:
+        circuit (Circuit): Input quantum circuit.
+        noise_generator (str): Type of noise operator ("z", "x", "y").
+    Returns:
+        np.ndarray: A 4D array B_{j,i} of shape (num_operations, 1, dim, dim) where num_operations is the number of gates in the circuit.
+    """
+    N = circuit.num_operations
+    num_qubits = circuit.num_qudits
+    dim = 2**num_qubits
+    
+    # Initialize B_array with zeros
+    B_array = np.zeros((N, 1, dim, dim), dtype=complex)
+
+    if noise_generator == "z":
+        noise_matrix = np.array([[1, 0], [0, -1]], dtype=complex)
+    elif noise_generator == "x":
+        noise_matrix = np.array([[0, 1], [1, 0]], dtype=complex)
+    elif noise_generator == "y":
+        noise_matrix = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    else:
+        raise ValueError(f"Unsupported noise generator: {noise_generator}")
+    
+    for i, op in enumerate(circuit):
+        j = op.location
+        num_active_qubits = len(j)
+        if num_active_qubits == 1:
+            j = j[0]
+            noise_tensor = np.kron(np.eye(2**j, dtype=complex), np.kron(noise_matrix, np.eye(2**(num_qubits-j-1), dtype=complex)))
+        
+        elif num_active_qubits == 2:
+            j1 = j[0]
+            j2 = j[1]
+            if j1 > j2:
+                j1, j2 = j2, j1
+            noise_tensor = np.kron(np.eye(2**j1, dtype=complex), np.kron(noise_matrix, np.kron(np.eye(2**(j2-j1-1), dtype=complex), np.kron(noise_matrix, np.eye(2**(num_qubits-j2-1), dtype=complex)))))
+        
+        else:
+            raise ValueError("Only single-qubit and two-qubit gates are supported for local error model.")
+
+        B_array[i, 0] = noise_tensor
+    
+    return B_array
+
+def compute_B_array_coherent_controll_local_error(layer_unitaries_list: list) -> np.ndarray:
+    """
+    Computes the B_{j,i} matrices for a list of layer unitaries, where each layer is treated individually
+    Args:
+        layer_unitaries_list (list of np.ndarray): List of unitaries for each layer.
+    Returns:
+        np.ndarray: A 4D array B_{j,i} of shape (N, 1, dim, dim) where N is the number of layers.
+    """
+    N = len(layer_unitaries_list)
+    dim = layer_unitaries_list[0].shape[0]
+    
+    # Initialize B_array with zeros
+    B_array = np.zeros((N, 1, dim, dim), dtype=complex)
+
+    for i, gate in enumerate(layer_unitaries_list):
+        H_e = 1j * logm(gate)
+        # ensure hermitianity numerically
+        H_e = (H_e + H_e.conj().T) / 2
+
+        # Fix: Remove the trace (global phase component)
+        H_e -= np.trace(H_e) / H_e.shape[0] * np.eye(H_e.shape[0])
+
+        B_array[i, 0] = H_e
+
+    # Calculate K as the maximum 2-norm of B_{i,0} for rescaling (to satisfy ∥B_{i}∥_2 ≤ 1)
+    K = max(matrix_2_norm(B_array[i, 0]) for i in range(N))
+    
+    return B_array, K
+
+def circuit_partitioning(circuit: QuantumCircuit, n_cut: int) -> list[QuantumCircuit]:
+    """
+    Partitions a Qiskit circuit into subcircuits such that each subcircuit 
+    acts on at most n_cut qubits.
+    
+    Args:
+        circuit (QuantumCircuit): The input circuit to be partitioned.
+        n_cut (int): The maximum number of active qubits allowed in a single subcircuit.
+        
+    Returns:
+        list[QuantumCircuit]: A list of partitioned subcircuits.
+        
+    Raises:
+        ValueError: If a single instruction acts on more qubits than n_cut.
+    """
+    subcircuits = []
+    
+    # Initialize the first subcircuit with the same registers as the original
+    current_subcircuit = QuantumCircuit(circuit.qubits, circuit.clbits)
+    active_qubits = set()
+    
+    for instruction in circuit.data:
+        # instruction is a CircuitInstruction object (operation, qargs, cargs)
+        op_qubits = set(instruction.qubits)
+        
+        # logical check: If a single gate is larger than the cut size, it's impossible
+        if len(op_qubits) > n_cut:
+            raise ValueError(
+                f"Instruction {instruction.operation.name} acts on {len(op_qubits)} "
+                f"qubits, which exceeds the limit of n_cut={n_cut}."
+            )
+        
+        # Check if adding this instruction exceeds the n_cut limit
+        potential_active_qubits = active_qubits.union(op_qubits)
+        
+        if len(potential_active_qubits) <= n_cut:
+            # It fits: add to current subcircuit and update active set
+            current_subcircuit.append(instruction)
+            active_qubits = potential_active_qubits
+        else:
+            # It doesn't fit: push current subcircuit and start a new one
+            subcircuits.append(remove_unused_wires(current_subcircuit))
+            
+            # Start new subcircuit
+            current_subcircuit = QuantumCircuit(circuit.qubits, circuit.clbits)
+            current_subcircuit.append(instruction)
+            active_qubits = op_qubits
+            
+    # Append the final subcircuit if it contains any operations
+    if len(current_subcircuit) > 0:
+        subcircuits.append(remove_unused_wires(current_subcircuit))
+        
+    return subcircuits
+
+def remove_unused_wires(qc: QuantumCircuit) -> QuantumCircuit:
+    """
+    Removes unused quantum wires from a Qiskit QuantumCircuit.
+    
+    Args:
+        qc (QuantumCircuit): The input circuit containing potentially empty wires.
+        
+    Returns:
+        QuantumCircuit: A new circuit with only the active quantum bits, 
+                        maintaining the relative order of the original qubits.
+    """
+    # 1. Identify all qubits that are actually used in instructions
+    used_qubits = set()
+    for instruction in qc.data:
+        for qubit in instruction.qubits:
+            used_qubits.add(qubit)
+            
+    # 2. Sort them by their original index to preserve relative ordering
+    #    (e.g., if q0 and q2 are used, q0 becomes new q0, q2 becomes new q1)
+    sorted_used_qubits = sorted(list(used_qubits), key=lambda q: qc.find_bit(q).index)
+    
+    # 3. Create a mapping from old Qubit objects to new qubit indices
+    #    key: old_qubit_object, value: new_index_integer
+    qubit_map = {old_q: i for i, old_q in enumerate(sorted_used_qubits)}
+    
+    # 4. Create the new circuit
+    #    We preserve the number of classical bits to ensure measurements still work
+    new_qc = QuantumCircuit(len(sorted_used_qubits), qc.num_clbits)
+    
+    # 5. Copy instructions to the new circuit using the mapping
+    for instruction in qc.data:
+        # Map the old qubits to the new circuit's qubits
+        new_qubits = [new_qc.qubits[qubit_map[q]] for q in instruction.qubits]
+        
+        # Map classical bits directly by index (preserving their structure)
+        new_clbits = [new_qc.clbits[qc.find_bit(c).index] for c in instruction.clbits]
+        
+        # Append the operation with the remapped bits
+        new_qc.append(instruction.operation, new_qubits, new_clbits)
+        
+    return new_qc
